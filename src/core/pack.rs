@@ -299,6 +299,39 @@ fn pack_content_data_files<W: io::Write + io::Seek>(
                         "content_file_id": cf_id,
                         "relative_path": to_nfc(&pioneer_rel),
                     }));
+
+                    // Artwork の兄弟ファイル (_m.jpg, _s.jpg) もパック
+                    if pioneer_rel.contains("Artwork") {
+                        if let Some(parent) = source.parent() {
+                            if let Some(parent_rel) = PathBuf::from(&pioneer_rel).parent() {
+                                for suffix in &["_m", "_s"] {
+                                    let sibling_name =
+                                        format!("artwork{}.jpg", suffix);
+                                    let sibling_path = parent.join(&sibling_name);
+                                    if sibling_path.exists() {
+                                        let sibling_rel = parent_rel
+                                            .join(&sibling_name)
+                                            .to_string_lossy()
+                                            .replace('\\', "/");
+                                        let sibling_entry =
+                                            format!("content_data/{}", sibling_rel);
+                                        if add_file_to_rkp(
+                                            writer,
+                                            &sibling_entry,
+                                            &sibling_path,
+                                        )
+                                        .is_ok()
+                                        {
+                                            data_files.push(json!({
+                                                "content_file_id": null,
+                                                "relative_path": to_nfc(&sibling_rel),
+                                            }));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     progress(&format!(

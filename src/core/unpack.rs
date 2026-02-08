@@ -349,7 +349,8 @@ fn extract_data_files(
             ));
 
             let entry_name = format!("content_data/{}", relative_path.replace('\\', "/"));
-            let target = share_dir.join(relative_path);
+            let native_rel = relative_path.replace('/', std::path::MAIN_SEPARATOR_STR);
+            let target = share_dir.join(&native_rel);
 
             match extract_rkp_entry(archive, &entry_name, &target) {
                 Ok(_) => {
@@ -583,7 +584,8 @@ fn insert_related_tables(
                         .map(|s| s.to_string())
                     {
                         let rel_trimmed = rel_path.trim_start_matches('/');
-                        let new_local = share_dir.join(rel_trimmed);
+                        let native_rel = rel_trimmed.replace('/', std::path::MAIN_SEPARATOR_STR);
+                        let new_local = share_dir.join(&native_rel);
                         let new_local_str = new_local.to_string_lossy().to_string();
                         obj.insert(
                             "rb_local_path".to_string(),
