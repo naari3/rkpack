@@ -1,4 +1,1 @@
-[env]
-# vcpkg でインストールした OpenSSL (bundled-sqlcipher のビルドに必要)
-OPENSSL_DIR = 'C:\Users\naari\src\github.com\microsoft\vcpkg\installed\x64-windows-static'
-OPENSSL_STATIC = "1"
+# bundled-sqlcipher-vendored-openssl により外部 OpenSSL は不要
