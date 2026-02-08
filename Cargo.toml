@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -15,6 +15,11 @@ eframe = "0.33.3"
 rfd = "0.17.2"
 ttf-parser = "0.25.1"
 sysinfo = "0.38.1"
+tracing = "0.1.44"
+tracing-appender = "0.2.4"
+dirs = "6.0.0"
+chrono = "0.4.43"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
 [package.metadata.bundle]
 name = "rkpack"

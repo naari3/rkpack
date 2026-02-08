@@ -69,7 +69,7 @@ pub fn run_cli() -> Result<()> {
     };
     let key = cli.key.as_deref().unwrap_or(core::DEFAULT_KEY);
 
-    println!("DB: {}", db_path.display());
+    tracing::info!("DB: {}", db_path.display());
 
     let read_only = matches!(
         cli.command,
@@ -92,13 +92,13 @@ pub fn run_cli() -> Result<()> {
             playlist,
             keep_structure,
         } => {
-            core::pack_playlist(&conn, &output, &playlist, keep_structure, &|msg| println!("{}", msg))?;
+            core::pack_playlist(&conn, &output, &playlist, keep_structure, &|msg| tracing::info!("{}", msg))?;
         }
         Command::Unpack {
             pack_path,
             dest_dir,
         } => {
-            core::unpack_playlist(&conn, &pack_path, &dest_dir, &|msg| println!("{}", msg))?;
+            core::unpack_playlist(&conn, &pack_path, &dest_dir, &|msg| tracing::info!("{}", msg))?;
         }
     }
 

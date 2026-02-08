@@ -137,18 +137,18 @@ pub fn list_tables(conn: &Connection) -> Result<()> {
 
     for (i, (name, sql)) in tables.iter().enumerate() {
         if i > 0 {
-            println!();
+            tracing::info!("");
         }
-        println!("-- {}", name);
-        println!("{};", format_create_table(sql));
+        tracing::info!("-- {}", name);
+        tracing::info!("{};", format_create_table(sql));
 
         for (_, idx_name, idx_sql) in indexes.iter().filter(|(tbl, _, _)| tbl == name) {
-            println!("-- index: {}", idx_name);
-            println!("{};", idx_sql);
+            tracing::info!("-- index: {}", idx_name);
+            tracing::info!("{};", idx_sql);
         }
     }
 
-    println!(
+    tracing::info!(
         "\n-- {} テーブル, {} インデックス",
         tables.len(),
         indexes.len()
@@ -165,17 +165,17 @@ pub fn list_playlists(conn: &Connection) -> Result<()> {
         &[],
     )?;
 
-    println!("{:<8} {:<6} {:<6} 名前", "ID", "種別", "曲数");
-    println!("{}", "-".repeat(60));
+    tracing::info!("{:<8} {:<6} {:<6} 名前", "ID", "種別", "曲数");
+    tracing::info!("{}", "-".repeat(60));
     for p in &playlists {
         let id = p["ID"].as_str().unwrap_or("");
         let name = p["Name"].as_str().unwrap_or("(no name)");
         let attr = p["Attribute"].as_i64().unwrap_or(0);
         let track_count = p["TrackCount"].as_i64().unwrap_or(0);
         let kind = if attr == 0 { "フォルダ" } else { "リスト" };
-        println!("{:<8} {:<6} {:<6} {}", id, kind, track_count, name);
+        tracing::info!("{:<8} {:<6} {:<6} {}", id, kind, track_count, name);
     }
-    println!("\n合計 {} プレイリスト", playlists.len());
+    tracing::info!("\n合計 {} プレイリスト", playlists.len());
     Ok(())
 }
 

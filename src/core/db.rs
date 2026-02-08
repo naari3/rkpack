@@ -78,7 +78,7 @@ pub fn export_decrypted(conn: &Connection, export_path: &str) -> Result<()> {
     conn.query_row("SELECT sqlcipher_export('plaintext')", [], |_| Ok(()))?;
     conn.execute_batch("DETACH DATABASE plaintext;")?;
 
-    println!("エクスポート完了: {}", export_path.display());
+    tracing::info!("エクスポート完了: {}", export_path.display());
     Ok(())
 }
 

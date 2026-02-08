@@ -210,6 +210,7 @@ impl RkpackApp {
             let tx_progress = tx.clone();
             let ctx_progress = ctx.clone();
             let progress = move |msg: &str| {
+                tracing::info!("{}", msg);
                 let _ = tx_progress.send(BgResult::Progress(msg.to_string()));
                 ctx_progress.request_repaint();
             };
@@ -260,6 +261,7 @@ impl RkpackApp {
             let tx_progress = tx.clone();
             let ctx_progress = ctx.clone();
             let progress = move |msg: &str| {
+                tracing::info!("{}", msg);
                 let _ = tx_progress.send(BgResult::Progress(msg.to_string()));
                 ctx_progress.request_repaint();
             };

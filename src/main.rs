@@ -1,6 +1,7 @@
 mod cli;
 mod core;
 mod gui;
+mod logging;
 
 /// 親プロセスがGUIシェル（explorer.exe / launchd）かどうかを判定する
 fn launched_from_gui() -> bool {
@@ -25,6 +26,8 @@ fn launched_from_gui() -> bool {
 }
 
 fn main() -> anyhow::Result<()> {
+    let _guard = logging::init_logging()?;
+
     if std::env::args().len() <= 1 && launched_from_gui() {
         gui::run_gui()
     } else {
