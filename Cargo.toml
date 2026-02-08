@@ -12,7 +12,7 @@ unicode-normalization = "0.1"
 zip = "7"
 clap = { version = "4.5.57", features = ["derive"] }
 eframe = "0.33.3"
-rfd = "0.17.2"
+rfd = { git = "https://github.com/naari3/rfd.git", branch = "master" }
 ttf-parser = "0.25.1"
 sysinfo = "0.38.1"
 tracing = "0.1.44"

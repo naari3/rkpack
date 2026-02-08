@@ -189,6 +189,7 @@ impl RkpackApp {
         };
 
         let save_path = rfd::FileDialog::new()
+            .set_dialog_id("rkpack-pack-save")
             .set_title("Pack 保存先")
             .set_file_name(format!("{}.rkp", playlist_name))
             .add_filter("rkp", &["rkp"])
@@ -234,6 +235,7 @@ impl RkpackApp {
         };
 
         let rkp_path = rfd::FileDialog::new()
+            .set_dialog_id("rkpack-unpack-rkp")
             .set_title("Unpack する .rkp ファイル")
             .add_filter("rkp", &["rkp"])
             .pick_file();
@@ -243,6 +245,7 @@ impl RkpackApp {
         };
 
         let dest_dir = rfd::FileDialog::new()
+            .set_dialog_id("rkpack-unpack-dest")
             .set_title("音声ファイルの配置先")
             .pick_folder();
 
@@ -335,6 +338,7 @@ impl eframe::App for RkpackApp {
                 }
                 if ui.button("Select DB...").clicked()
                     && let Some(path) = rfd::FileDialog::new()
+                        .set_dialog_id("rkpack-select-db")
                         .set_title("master.db を選択")
                         .add_filter("SQLite DB", &["db"])
                         .pick_file()
