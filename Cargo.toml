@@ -11,3 +11,7 @@ serde_json = "1"
 unicode-normalization = "0.1"
 zip = "7"
 clap = { version = "4.5.57", features = ["derive"] }
+eframe = "0.33.3"
+rfd = "0.17.2"
+ttf-parser = "0.25.1"
+sysinfo = "0.38.1"
