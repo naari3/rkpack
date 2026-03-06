@@ -230,11 +230,12 @@ pub struct PlaylistInfo {
 }
 
 pub struct TrackInfo {
-    #[allow(dead_code)]
     pub id: String,
     pub title: String,
     pub artist: String,
     pub album: String,
+    pub memory_cue_count: i64,
+    pub hot_cue_count: i64,
 }
 
 pub fn get_playlists(conn: &Connection) -> Result<Vec<PlaylistInfo>> {
@@ -263,7 +264,11 @@ pub fn get_playlist_tracks(conn: &Connection, playlist_id: &str) -> Result<Vec<T
         conn,
         "SELECT c.ID, c.Title, \
          COALESCE(a.Name, '') as ArtistName, \
-         COALESCE(al.Name, '') as AlbumName \
+         COALESCE(al.Name, '') as AlbumName, \
+         (SELECT COUNT(*) FROM djmdCue cue \
+          WHERE cue.ContentID = c.ID AND cue.Kind = 0 AND cue.rb_local_deleted = 0) as MemoryCueCount, \
+         (SELECT COUNT(*) FROM djmdCue cue \
+          WHERE cue.ContentID = c.ID AND cue.Kind != 0 AND cue.rb_local_deleted = 0) as HotCueCount \
          FROM djmdSongPlaylist sp \
          JOIN djmdContent c ON c.ID = sp.ContentID \
          LEFT JOIN djmdArtist a ON a.ID = c.ArtistID \
@@ -280,6 +285,8 @@ pub fn get_playlist_tracks(conn: &Connection, playlist_id: &str) -> Result<Vec<T
             title: row["Title"].as_str().unwrap_or("").to_string(),
             artist: row["ArtistName"].as_str().unwrap_or("").to_string(),
             album: row["AlbumName"].as_str().unwrap_or("").to_string(),
+            memory_cue_count: row["MemoryCueCount"].as_i64().unwrap_or(0),
+            hot_cue_count: row["HotCueCount"].as_i64().unwrap_or(0),
         });
     }
     Ok(tracks)

@@ -98,7 +98,23 @@ pub fn run_cli() -> Result<()> {
             pack_path,
             dest_dir,
         } => {
-            core::unpack_playlist(&conn, &pack_path, &dest_dir, &|msg| tracing::info!("{}", msg))?;
+            let confirm = |info: &core::DuplicateInfo| -> bool {
+                eprintln!("重複トラックが見つかりました:");
+                eprintln!(
+                    "  元のトラック名: {} メモリーキュー: {}個 ホットキュー: {}個",
+                    info.existing_title, info.existing_memory_cue_count, info.existing_hot_cue_count
+                );
+                eprintln!(
+                    "  新しいトラック名: {} メモリーキュー: {}個 ホットキュー: {}個",
+                    info.new_title, info.new_memory_cue_count, info.new_hot_cue_count
+                );
+                eprint!("更新しますか？ [y/N] ");
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input).unwrap_or(0);
+                input.trim().eq_ignore_ascii_case("y")
+            };
+            core::unpack_playlist(&conn, &pack_path, &dest_dir, &|msg| tracing::info!("{}", msg), &confirm)?;
         }
     }
 

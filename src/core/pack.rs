@@ -354,14 +354,29 @@ fn pack_content_data_files<W: io::Write + io::Seek>(
     Ok((data_files, stats))
 }
 
-pub fn pack_playlist(
+fn find_playlist_by_id(
+    conn: &Connection,
+    playlist_id: &str,
+) -> Result<serde_json::Value> {
+    let playlists = query_table_rows(
+        conn,
+        "SELECT * FROM djmdPlaylist WHERE ID = ? AND rb_local_deleted = 0",
+        &[&playlist_id],
+    )?;
+
+    if playlists.is_empty() {
+        anyhow::bail!("プレイリスト ID '{}' が見つかりません", playlist_id);
+    }
+    Ok(playlists.into_iter().next().unwrap())
+}
+
+fn do_pack(
     conn: &Connection,
     output: &str,
-    playlist_name: &str,
+    playlist: serde_json::Value,
     keep_structure: bool,
     progress: &dyn Fn(&str),
 ) -> Result<()> {
-    let playlist = find_playlist(conn, playlist_name, progress)?;
     let data = collect_pack_data(conn, playlist, progress)?;
 
     let output_path = PathBuf::from(output);
@@ -439,4 +454,26 @@ pub fn pack_playlist(
     }
 
     Ok(())
+}
+
+pub fn pack_playlist(
+    conn: &Connection,
+    output: &str,
+    playlist_name: &str,
+    keep_structure: bool,
+    progress: &dyn Fn(&str),
+) -> Result<()> {
+    let playlist = find_playlist(conn, playlist_name, progress)?;
+    do_pack(conn, output, playlist, keep_structure, progress)
+}
+
+pub fn pack_playlist_by_id(
+    conn: &Connection,
+    output: &str,
+    playlist_id: &str,
+    keep_structure: bool,
+    progress: &dyn Fn(&str),
+) -> Result<()> {
+    let playlist = find_playlist_by_id(conn, playlist_id)?;
+    do_pack(conn, output, playlist, keep_structure, progress)
 }
