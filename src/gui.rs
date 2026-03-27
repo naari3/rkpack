@@ -318,6 +318,7 @@ impl RkpackApp {
         let mut skipped_content_ids = HashSet::new();
         let mut update_content_ids = HashSet::new();
         let mut existing_content_map = HashMap::new();
+        let mut content_id_overrides = HashMap::new();
 
         for track in &preview.tracks {
             match track.decision {
@@ -335,7 +336,14 @@ impl RkpackApp {
                             .insert(track.pack_content_id.clone(), dup.existing_content_id.clone());
                     }
                 }
-                core::DuplicateDecision::New => {}
+                core::DuplicateDecision::New => {
+                    if track.content_id_input != track.pack_content_id {
+                        content_id_overrides.insert(
+                            track.pack_content_id.clone(),
+                            track.content_id_input.clone(),
+                        );
+                    }
+                }
             }
         }
 
@@ -343,6 +351,7 @@ impl RkpackApp {
             skipped_content_ids,
             update_content_ids,
             existing_content_map,
+            content_id_overrides,
         };
 
         let pack_path = preview.rkp_path.clone();

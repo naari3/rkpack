@@ -49,6 +49,8 @@ pub struct UnpackDecisions {
     pub skipped_content_ids: HashSet<String>,
     pub update_content_ids: HashSet<String>,
     pub existing_content_map: HashMap<String, String>,
+    /// pack_content_id → ユーザー指定の新ContentID
+    pub content_id_overrides: HashMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -333,6 +335,7 @@ fn build_content_id_map(
     conn: &Connection,
     tables: &serde_json::Map<String, serde_json::Value>,
     existing_content_map: &HashMap<String, String>,
+    content_id_overrides: &HashMap<String, String>,
     id_map: &mut IdMap,
 ) -> Result<()> {
     let content_table = "djmdContent";
@@ -350,7 +353,9 @@ fn build_content_id_map(
             None => continue,
         };
 
-        if let Some(existing_cid) = existing_content_map.get(&old_id) {
+        if let Some(override_id) = content_id_overrides.get(&old_id) {
+            table_map.insert(old_id, override_id.clone());
+        } else if let Some(existing_cid) = existing_content_map.get(&old_id) {
             table_map.insert(old_id, existing_cid.clone());
         } else {
             max_id += 1;
@@ -857,7 +862,7 @@ pub fn unpack_playlist(
 
     let mut id_map: IdMap = HashMap::new();
     build_master_id_map(conn, tables, &mut id_map)?;
-    build_content_id_map(conn, tables, &existing_content_map, &mut id_map)?;
+    build_content_id_map(conn, tables, &existing_content_map, &HashMap::new(), &mut id_map)?;
     build_related_id_maps(conn, tables, &pack_data, &mut id_map)?;
 
     let share_dir = get_share_dir();
@@ -1177,7 +1182,7 @@ pub fn unpack_playlist_with_decisions(
 
     let mut id_map: IdMap = HashMap::new();
     build_master_id_map(conn, tables, &mut id_map)?;
-    build_content_id_map(conn, tables, existing_content_map, &mut id_map)?;
+    build_content_id_map(conn, tables, existing_content_map, &decisions.content_id_overrides, &mut id_map)?;
     build_related_id_maps(conn, tables, &pack_data, &mut id_map)?;
 
     let share_dir = get_share_dir();
