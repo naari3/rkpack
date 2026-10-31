@@ -306,18 +306,10 @@ impl RkpackApp {
             }
         }
 
-        let dest_dir = rfd::FileDialog::new()
-            .set_dialog_id("rkpack-unpack-dest")
-            .set_title("音声ファイルの配置先")
-            .pick_folder();
-
-        let Some(dest_dir) = dest_dir else {
-            return;
-        };
-
         let mut skipped_content_ids = HashSet::new();
         let mut update_content_ids = HashSet::new();
         let mut existing_content_map = HashMap::new();
+        let mut new_content_ids = HashMap::new();
 
         for track in &preview.tracks {
             match track.decision {
@@ -335,7 +327,12 @@ impl RkpackApp {
                             .insert(track.pack_content_id.clone(), dup.existing_content_id.clone());
                     }
                 }
-                core::DuplicateDecision::New => {}
+                core::DuplicateDecision::New => {
+                    new_content_ids.insert(
+                        track.pack_content_id.clone(),
+                        track.content_id_input.trim().to_string(),
+                    );
+                }
             }
         }
 
@@ -343,6 +340,32 @@ impl RkpackApp {
             skipped_content_ids,
             update_content_ids,
             existing_content_map,
+            new_content_ids,
+        };
+
+        // 指定された ContentID の検証 (配置先を選ばせる前に弾く)
+        match core::open_rekordbox_db(db_path, core::DEFAULT_KEY, true) {
+            Ok(conn) => {
+                if let Err(e) = core::validate_new_content_ids(&conn, &decisions.new_content_ids) {
+                    self.status = format!("エラー: {}", e);
+                    return;
+                }
+            }
+            Err(e) => {
+                self.status = format!("エラー: DB を開けません: {}", e);
+                return;
+            }
+        }
+
+
+
+        let dest_dir = rfd::FileDialog::new()
+            .set_dialog_id("rkpack-unpack-dest")
+            .set_title("音声ファイルの配置先")
+            .pick_folder();
+
+        let Some(dest_dir) = dest_dir else {
+            return;
         };
 
         let pack_path = preview.rkp_path.clone();
@@ -576,6 +599,14 @@ impl RkpackApp {
                     ui.label(&preview_name);
                 }
             });
+            if let Some(ref preview) = self.preview_data {
+                let dup_count = preview.tracks.iter().filter(|t| t.duplicate.is_some()).count();
+                ui.label(format!(
+                    "{} 曲中 {} 曲が既存トラックと重複",
+                    preview.tracks.len(),
+                    dup_count
+                ));
+            }
         });
 
         let mut do_back = false;
@@ -611,11 +642,45 @@ impl RkpackApp {
                         .open(&mut open)
                         .show(ctx, |ui| {
                             if let Some(ref dup) = track.duplicate {
+                                ui.label(match dup.info.match_kind {
+                                    core::DuplicateMatchKind::AudioIdentical => {
+                                        "一致理由: 音声ファイルが既存トラックとバイト単位で一致"
+                                    }
+                                    core::DuplicateMatchKind::SameAnalysis => {
+                                        "一致理由: 解析データ (ANLZ) と曲の長さが一致 (同じ音源の別ファイルの可能性)"
+                                    }
+                                    core::DuplicateMatchKind::ContentId => {
+                                        "一致理由: 入力した ContentID が既存トラックの ID と一致"
+                                    }
+                                });
+                                if dup.info.candidate_count > 1 {
+                                    ui.label(format!(
+                                        "他にも {} 件の既存トラックが一致 (最も確度の高いものを表示)",
+                                        dup.info.candidate_count - 1
+                                    ));
+                                }
+                                ui.add_space(4.0);
                                 ui.group(|ui| {
                                     ui.label("既存データ:");
                                     ui.label(format!(
+                                        "  ContentID: {}",
+                                        dup.existing_content_id
+                                    ));
+                                    ui.label(format!(
                                         "  トラック名: {}",
                                         dup.info.existing_title
+                                    ));
+                                    ui.label(format!(
+                                        "  アーティスト: {}",
+                                        dup.info.existing_artist
+                                    ));
+                                    ui.label(format!(
+                                        "  アルバム: {}",
+                                        dup.info.existing_album
+                                    ));
+                                    ui.label(format!(
+                                        "  ファイル: {}",
+                                        dup.info.existing_path
                                     ));
                                     ui.label(format!(
                                         "  メモリーキュー: {}個  ホットキュー: {}個",
@@ -626,7 +691,13 @@ impl RkpackApp {
                                 ui.add_space(4.0);
                                 ui.group(|ui| {
                                     ui.label("新しいデータ:");
+                                    ui.label(format!(
+                                        "  ContentID (パック内): {}",
+                                        track.pack_content_id
+                                    ));
                                     ui.label(format!("  トラック名: {}", track.title));
+                                    ui.label(format!("  アーティスト: {}", track.artist));
+                                    ui.label(format!("  アルバム: {}", track.album));
                                     ui.label(format!(
                                         "  メモリーキュー: {}個  ホットキュー: {}個",
                                         track.memory_cue_count, track.hot_cue_count
@@ -669,23 +740,38 @@ impl RkpackApp {
 
         if let Some((idx, decision)) = detail_decision {
             if let Some(ref mut preview) = self.preview_data {
-                if let Some(track) = preview.tracks.get_mut(idx) {
+                if idx < preview.tracks.len() {
                     if decision == core::DuplicateDecision::New {
-                        // Auto-assign new ContentID
+                        // 新しい ContentID を自動割り当て (DB と他トラックの指定の両方を避ける)
+                        let others: HashSet<String> = preview
+                            .tracks
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| *i != idx)
+                            .map(|(_, t)| t.content_id_input.trim().to_string())
+                            .collect();
                         if let Some(ref db_path) = self.db_path {
                             if let Ok(conn) =
                                 core::open_rekordbox_db(db_path, core::DEFAULT_KEY, true)
                             {
-                                if let Ok(max_id) = conn.query_row(
-                                    "SELECT MAX(CAST(ID AS INTEGER)) FROM djmdContent",
-                                    [],
-                                    |row| row.get::<_, Option<i64>>(0),
-                                ) {
-                                    let new_id = max_id.unwrap_or(0) + 1;
-                                    track.content_id_input = new_id.to_string();
+                                match core::generate_content_ids(&conn, 1, &others) {
+                                    Ok(ids) => {
+                                        let track = &mut preview.tracks[idx];
+                                        track.content_id_input = ids[0].clone();
+                                        if let Some(prev) = self.prev_content_id_inputs.get_mut(idx)
+                                        {
+                                            *prev = track.content_id_input.clone();
+                                        }
+                                    }
+                                    Err(e) => {
+                                        self.status = format!("ContentID の生成に失敗: {}", e);
+                                    }
                                 }
                             }
                         }
+                    }
+                    let track = &mut preview.tracks[idx];
+                    if decision == core::DuplicateDecision::New {
                         track.duplicate = None;
                     }
                     track.decision = decision;
@@ -697,7 +783,7 @@ impl RkpackApp {
             if let Some(ref mut preview) = self.preview_data {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     egui::Grid::new("preview_grid")
-                        .num_columns(8)
+                        .num_columns(9)
                         .striped(true)
                         .min_col_width(40.0)
                         .show(ui, |ui| {
@@ -709,6 +795,7 @@ impl RkpackApp {
                             ui.strong("Album");
                             ui.strong("Mem Cue");
                             ui.strong("Hot Cue");
+                            ui.strong("重複先 (既存トラック)");
                             ui.end_row();
 
                             for (i, track) in preview.tracks.iter_mut().enumerate() {
@@ -752,6 +839,43 @@ impl RkpackApp {
                                 ui.label(&track.album);
                                 ui.label(track.memory_cue_count.to_string());
                                 ui.label(track.hot_cue_count.to_string());
+                                if let Some(ref dup) = track.duplicate {
+                                    let kind = match dup.info.match_kind {
+                                        core::DuplicateMatchKind::AudioIdentical => "音声一致",
+                                        core::DuplicateMatchKind::SameAnalysis => "解析一致",
+                                        core::DuplicateMatchKind::ContentId => "ID一致",
+                                    };
+                                    let text = if dup.info.existing_artist.is_empty() {
+                                        format!(
+                                            "[{}] ID {}: {}",
+                                            kind, dup.existing_content_id, dup.info.existing_title
+                                        )
+                                    } else {
+                                        format!(
+                                            "[{}] ID {}: {} / {}",
+                                            kind,
+                                            dup.existing_content_id,
+                                            dup.info.existing_title,
+                                            dup.info.existing_artist
+                                        )
+                                    };
+                                    let mut hover = format!(
+                                        "アルバム: {}\nファイル: {}\nメモリーキュー: {}個  ホットキュー: {}個",
+                                        dup.info.existing_album,
+                                        dup.info.existing_path,
+                                        dup.info.existing_memory_cue_count,
+                                        dup.info.existing_hot_cue_count
+                                    );
+                                    if dup.info.candidate_count > 1 {
+                                        hover.push_str(&format!(
+                                            "\n他にも {} 件の既存トラックが一致",
+                                            dup.info.candidate_count - 1
+                                        ));
+                                    }
+                                    ui.label(text).on_hover_text(hover);
+                                } else {
+                                    ui.label("-");
+                                }
                                 ui.end_row();
                             }
                         });

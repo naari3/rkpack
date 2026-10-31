@@ -1,14 +1,213 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 pub(crate) type IdMap = HashMap<String, HashMap<String, String>>;
 
-pub(crate) fn get_max_numeric_id(conn: &Connection, table: &str) -> Result<i64> {
-    let sql = format!("SELECT MAX(CAST(ID AS INTEGER)) FROM `{}`", table);
-    let max_id: Option<i64> = conn.query_row(&sql, [], |row| row.get(0)).unwrap_or(None);
-    Ok(max_id.unwrap_or(0))
+/// rekordbox の ID 形式 (実 DB の観察に基づく。notes/id-allocation.md 参照)
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum IdKind {
+    /// [100, 2^28) の乱数 (djmdContent)
+    Random28,
+    /// [100, 2^32) の乱数 (マスタ系、djmdPlaylist、djmdCue など)
+    Random32,
+    /// UUID v4 文字列 (djmdSongPlaylist、djmdMixerParam、contentCue など)
+    Uuid,
+    /// `<djmdContent.UUID>_<パーセントエンコードした Path>` (contentFile)
+    ContentFile,
+}
+
+pub(crate) const CONTENT_ID_LIMIT: u64 = 1 << 28;
+const MIN_RANDOM_ID: u64 = 100;
+
+pub(crate) fn id_kind_for_table(table: &str) -> IdKind {
+    match table {
+        "djmdContent" => IdKind::Random28,
+        "contentFile" => IdKind::ContentFile,
+        // 観察で UUID だったテーブル
+        "djmdSongPlaylist" | "djmdMixerParam" | "contentCue" | "djmdSongHistory"
+        // データがなく推定 (notes/id-allocation.md 調査 3)
+        | "contentActiveCensor" | "djmdSongMyTag" | "djmdSongTagList"
+        | "djmdSongHotCueBanklist" | "hotCueBanklistCue" => IdKind::Uuid,
+        _ => IdKind::Random32,
+    }
+}
+
+/// rekordbox の採番方式に合わせて未使用の ID を払い出す。
+/// DB 上の既存行 (論理削除済み含む) と、このセッションで払い出し済みの ID の両方を避ける。
+#[derive(Default)]
+pub(crate) struct IdAllocator {
+    allocated: HashMap<String, HashSet<String>>,
+}
+
+impl IdAllocator {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// 呼び出し側で決めた ID (ユーザー指定の ContentID など) を払い出し済みとして登録する
+    pub(crate) fn reserve(&mut self, table: &str, id: &str) {
+        self.allocated
+            .entry(table.to_string())
+            .or_default()
+            .insert(id.to_string());
+    }
+
+    fn is_free(&self, conn: &Connection, table: &str, id: &str) -> Result<bool> {
+        if self
+            .allocated
+            .get(table)
+            .is_some_and(|set| set.contains(id))
+        {
+            return Ok(false);
+        }
+        id_exists(conn, table, id).map(|exists| !exists)
+    }
+
+    /// Random28 / Random32 / Uuid のテーブルの新しい ID を払い出す
+    pub(crate) fn allocate(&mut self, conn: &Connection, table: &str) -> Result<String> {
+        let kind = id_kind_for_table(table);
+        for _ in 0..1_000_000 {
+            let candidate = match kind {
+                IdKind::Random28 => random_id(CONTENT_ID_LIMIT),
+                IdKind::Random32 => random_id(1 << 32),
+                IdKind::Uuid => uuid::Uuid::new_v4().to_string(),
+                IdKind::ContentFile => {
+                    anyhow::bail!("contentFile の ID は allocate_content_file で払い出す")
+                }
+            };
+            if self.is_free(conn, table, &candidate)? {
+                self.reserve(table, &candidate);
+                return Ok(candidate);
+            }
+        }
+        anyhow::bail!("{} の未使用 ID を生成できませんでした", table)
+    }
+
+    /// contentFile の ID を rekordbox と同じ形式で払い出す。
+    /// 同じ ID が既にある場合 (同じパックを新規として二重に取り込んだ場合など) は None を返す。
+    pub(crate) fn allocate_content_file(
+        &mut self,
+        conn: &Connection,
+        content_uuid: &str,
+        path: &str,
+    ) -> Result<Option<String>> {
+        let candidate = content_file_id(content_uuid, path);
+        if self.is_free(conn, "contentFile", &candidate)? {
+            self.reserve("contentFile", &candidate);
+            Ok(Some(candidate))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+fn random_id(limit: u64) -> String {
+    loop {
+        let v = rand::random::<u64>() % limit;
+        if v >= MIN_RANDOM_ID {
+            return v.to_string();
+        }
+    }
+}
+
+pub(crate) fn id_exists(conn: &Connection, table: &str, id: &str) -> Result<bool> {
+    let sql = format!("SELECT 1 FROM `{}` WHERE ID = ? LIMIT 1", table);
+    let exists = conn
+        .query_row(&sql, params![id], |_| Ok(()))
+        .optional()?
+        .is_some();
+    Ok(exists)
+}
+
+/// `<content UUID>_<Path>` で、Path は英数字と `_.-~` 以外をすべて %XX (大文字) にする
+pub(crate) fn content_file_id(content_uuid: &str, path: &str) -> String {
+    let mut encoded = String::with_capacity(path.len() * 3);
+    for b in path.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b'~') {
+            encoded.push(b as char);
+        } else {
+            encoded.push_str(&format!("%{:02X}", b));
+        }
+    }
+    format!("{}_{}", content_uuid, encoded)
+}
+
+/// localUpdateCount を基に、挿入する行の rb_local_usn を 1 ずつ払い出す
+pub(crate) struct UsnCounter {
+    current: i64,
+}
+
+impl UsnCounter {
+    pub(crate) fn load(conn: &Connection) -> Result<Self> {
+        let current: i64 = conn
+            .query_row(
+                "SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten()
+            .context("agentRegistry の localUpdateCount が見つかりません")?;
+        Ok(Self { current })
+    }
+
+    /// 行に新しい rb_local_usn を設定する (1 行ごとに +1)
+    pub(crate) fn assign(&mut self, table: &str, row: &mut serde_json::Value) {
+        if !Self::is_tracked(table, row) {
+            return;
+        }
+        self.current += 1;
+        Self::set(row, self.current);
+    }
+
+    /// 複数行に同じ rb_local_usn を設定する。rekordbox は djmdSongPlaylist のまとめ追加で
+    /// 1 回の操作に 1 つの USN を使う (notes/id-allocation-ghidra.md、実 DB でも同じ傾向)
+    pub(crate) fn assign_batch(&mut self, table: &str, rows: &mut [serde_json::Value]) {
+        let tracked: Vec<usize> = (0..rows.len())
+            .filter(|&i| Self::is_tracked(table, &rows[i]))
+            .collect();
+        if tracked.is_empty() {
+            return;
+        }
+        self.current += 1;
+        for i in tracked {
+            Self::set(&mut rows[i], self.current);
+        }
+    }
+
+    /// rekordbox がライブラリ同期の対象外 (NoLibrarySyncSql) として USN を付けないテーブルと、
+    /// rb_local_usn 列のない行は対象外
+    fn is_tracked(table: &str, row: &serde_json::Value) -> bool {
+        const UNTRACKED: &[&str] = &[
+            "djmdCue",
+            "djmdActiveCensor",
+            "djmdSongHotCueBanklist",
+            "djmdSongTagList",
+        ];
+        !UNTRACKED.contains(&table)
+            && row
+                .as_object()
+                .is_some_and(|obj| obj.contains_key("rb_local_usn"))
+    }
+
+    fn set(row: &mut serde_json::Value, usn: i64) {
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert(
+                "rb_local_usn".to_string(),
+                serde_json::Value::Number(usn.into()),
+            );
+        }
+    }
+
+    pub(crate) fn save(&self, conn: &Connection) -> Result<()> {
+        conn.execute(
+            "UPDATE agentRegistry SET int_1 = ? WHERE registry_id = 'localUpdateCount'",
+            params![self.current],
+        )?;
+        Ok(())
+    }
 }
 
 pub(crate) fn find_existing_master_id(

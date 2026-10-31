@@ -4,13 +4,13 @@ use std::io;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use zip::ZipArchive;
 
 use super::db::get_actual_path_on_disk;
 use super::id_mapping::{
-    IdMap, apply_mapping, find_existing_master_id, get_max_numeric_id, insert_row,
-    master_table_name_column, remap_json_blob,
+    CONTENT_ID_LIMIT, IdAllocator, IdMap, UsnCounter, apply_mapping, content_file_id,
+    find_existing_master_id, id_exists, insert_row, master_table_name_column, remap_json_blob,
 };
 
 #[derive(Clone, PartialEq)]
@@ -49,11 +49,29 @@ pub struct UnpackDecisions {
     pub skipped_content_ids: HashSet<String>,
     pub update_content_ids: HashSet<String>,
     pub existing_content_map: HashMap<String, String>,
+    /// 新規追加するトラックの ContentID 指定 (パック内 ContentID → 挿入先 ContentID)
+    pub new_content_ids: HashMap<String, String>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum DuplicateMatchKind {
+    /// 音声ファイルがバイト単位で既存トラックと一致
+    AudioIdentical,
+    /// ANLZ 解析ファイルのハッシュが一致し、曲の長さも同じ (同じ音源の別ファイルと思われる)
+    SameAnalysis,
+    /// 入力された ContentID が既存トラックの ID と一致
+    ContentId,
 }
 
 #[derive(Clone)]
 pub struct DuplicateInfo {
+    pub match_kind: DuplicateMatchKind,
+    /// 重複と判定された既存トラックの数 (表示しているのはそのうち最も確度の高い 1 件)
+    pub candidate_count: usize,
     pub existing_title: String,
+    pub existing_artist: String,
+    pub existing_album: String,
+    pub existing_path: String,
     pub existing_memory_cue_count: usize,
     pub existing_hot_cue_count: usize,
     pub new_title: String,
@@ -93,35 +111,69 @@ fn load_pack_data(archive: &mut ZipArchive<fs::File>) -> Result<serde_json::Valu
     Ok(pack_data)
 }
 
+struct ExistingTrack {
+    title: String,
+    artist: String,
+    album: String,
+    path: String,
+    memory_cue_count: usize,
+    hot_cue_count: usize,
+}
+
+fn query_existing_track(conn: &Connection, content_id: &str) -> Option<ExistingTrack> {
+    let (title, artist, album, path) = conn
+        .query_row(
+            "SELECT c.Title, a.Name, al.Name, c.FolderPath
+             FROM djmdContent c
+             LEFT JOIN djmdArtist a ON a.ID = c.ArtistID
+             LEFT JOIN djmdAlbum al ON al.ID = c.AlbumID
+             WHERE c.ID = ? AND c.rb_local_deleted = 0",
+            params![content_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                ))
+            },
+        )
+        .ok()?;
+
+    let memory_cue_count: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM djmdCue WHERE ContentID = ? AND Kind = 0 AND rb_local_deleted = 0",
+            params![content_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as usize;
+
+    let hot_cue_count: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM djmdCue WHERE ContentID = ? AND Kind != 0 AND rb_local_deleted = 0",
+            params![content_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as usize;
+
+    Some(ExistingTrack {
+        title,
+        artist,
+        album,
+        path,
+        memory_cue_count,
+        hot_cue_count,
+    })
+}
+
 fn build_duplicate_info(
     conn: &Connection,
     tables: &serde_json::Map<String, serde_json::Value>,
     pack_cid: &str,
-    existing_cid: &str,
+    found: &FoundDuplicate,
 ) -> DuplicateInfo {
-    let existing_title: String = conn
-        .query_row(
-            "SELECT Title FROM djmdContent WHERE ID = ?",
-            params![existing_cid],
-            |row| row.get(0),
-        )
-        .unwrap_or_default();
-
-    let existing_memory_cue_count: usize = conn
-        .query_row(
-            "SELECT COUNT(*) FROM djmdCue WHERE ContentID = ? AND Kind = 0 AND rb_local_deleted = 0",
-            params![existing_cid],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(0) as usize;
-
-    let existing_hot_cue_count: usize = conn
-        .query_row(
-            "SELECT COUNT(*) FROM djmdCue WHERE ContentID = ? AND Kind != 0 AND rb_local_deleted = 0",
-            params![existing_cid],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(0) as usize;
+    let existing_cid = found.existing_content_id.as_str();
+    let existing = query_existing_track(conn, existing_cid);
 
     let new_title = tables
         .get("djmdContent")
@@ -154,8 +206,19 @@ fn build_duplicate_info(
         .filter(|c| c.get("Kind").and_then(|v| v.as_i64()) != Some(0))
         .count();
 
+    let (existing_title, existing_artist, existing_album, existing_path, existing_memory_cue_count, existing_hot_cue_count) =
+        match existing {
+            Some(e) => (e.title, e.artist, e.album, e.path, e.memory_cue_count, e.hot_cue_count),
+            None => Default::default(),
+        };
+
     DuplicateInfo {
+        match_kind: found.kind,
+        candidate_count: found.candidate_count,
         existing_title,
+        existing_artist,
+        existing_album,
+        existing_path,
         existing_memory_cue_count,
         existing_hot_cue_count,
         new_title,
@@ -164,8 +227,207 @@ fn build_duplicate_info(
     }
 }
 
+struct FoundDuplicate {
+    existing_content_id: String,
+    kind: DuplicateMatchKind,
+    candidate_count: usize,
+}
+
+struct DuplicateCandidate {
+    content_id: String,
+    analysis_match: bool,
+    file_size: Option<i64>,
+    length: Option<i64>,
+    folder_path: String,
+    created_at: String,
+}
+
+fn json_i64(v: Option<&serde_json::Value>) -> Option<i64> {
+    match v? {
+        serde_json::Value::Number(n) => n.as_i64(),
+        serde_json::Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+/// 2 つのストリームの中身が完全に一致するか
+fn streams_equal(mut a: impl io::Read, mut b: impl io::Read) -> io::Result<bool> {
+    fn fill(r: &mut impl io::Read, buf: &mut [u8]) -> io::Result<usize> {
+        let mut n = 0;
+        while n < buf.len() {
+            match r.read(&mut buf[n..])? {
+                0 => break,
+                k => n += k,
+            }
+        }
+        Ok(n)
+    }
+    let mut buf_a = vec![0u8; 1 << 16];
+    let mut buf_b = vec![0u8; 1 << 16];
+    loop {
+        let na = fill(&mut a, &mut buf_a)?;
+        let nb = fill(&mut b, &mut buf_b)?;
+        if na != nb || buf_a[..na] != buf_b[..nb] {
+            return Ok(false);
+        }
+        if na == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+/// パック内のトラックと同じ曲が既存 DB にあるかを判定する。
+///
+/// contentFile.Hash は ANLZ 解析ファイルと artwork.jpg のハッシュで、音声ファイル本体は含まない。
+/// artwork はアルバム単位で別の曲とも一致するため、それだけでは重複とみなさない。
+/// - 音声一致: ファイルサイズが同じ既存トラックについて、パック内の音声と既存ファイルをバイト比較して一致
+/// - 解析一致: ANLZ のいずれかのハッシュが一致し、曲の長さも同じ
+/// 候補が複数あれば、音声一致 > 解析一致、同順位なら ANLZ 一致あり > 古い登録の順に選ぶ。
+fn find_duplicate(
+    conn: &Connection,
+    archive: &mut ZipArchive<fs::File>,
+    pack_data: &serde_json::Value,
+    tables: &serde_json::Map<String, serde_json::Value>,
+    pack_cid: &str,
+) -> Result<Option<FoundDuplicate>> {
+    let Some(content) = tables
+        .get("djmdContent")
+        .and_then(|v| v.as_array())
+        .and_then(|rows| {
+            rows.iter()
+                .find(|c| c.get("ID").and_then(|v| v.as_str()) == Some(pack_cid))
+        })
+    else {
+        return Ok(None);
+    };
+    let pack_size = json_i64(content.get("FileSize")).filter(|s| *s > 0);
+    let pack_length = json_i64(content.get("Length")).filter(|l| *l > 0);
+
+    // 候補集め: contentFile.Hash の一致 (ANLZ か artwork か) と、ファイルサイズの一致
+    let mut candidate_ids: HashMap<String, bool> = HashMap::new();
+    if let Some(content_files) = tables.get("contentFile").and_then(|v| v.as_array()) {
+        for cf in content_files {
+            if cf.get("ContentID").and_then(|v| v.as_str()) != Some(pack_cid) {
+                continue;
+            }
+            let Some(hash) = cf.get("Hash").and_then(|v| v.as_str()).filter(|h| !h.is_empty())
+            else {
+                continue;
+            };
+            let is_analysis = cf
+                .get("Path")
+                .and_then(|v| v.as_str())
+                .and_then(|p| p.rsplit('/').next())
+                .is_some_and(|name| name.starts_with("ANLZ"));
+            let mut stmt = conn.prepare_cached(
+                "SELECT ContentID FROM contentFile WHERE Hash = ? AND rb_local_deleted = 0",
+            )?;
+            let ids: Vec<String> = stmt
+                .query_map(params![hash], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            for id in ids {
+                let entry = candidate_ids.entry(id).or_insert(false);
+                *entry |= is_analysis;
+            }
+        }
+    }
+    if let Some(size) = pack_size {
+        let mut stmt = conn.prepare_cached(
+            "SELECT ID FROM djmdContent WHERE FileSize = ? AND rb_local_deleted = 0",
+        )?;
+        let ids: Vec<String> = stmt
+            .query_map(params![size], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        for id in ids {
+            candidate_ids.entry(id).or_insert(false);
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for (content_id, analysis_match) in candidate_ids {
+        let row = conn
+            .query_row(
+                "SELECT FileSize, Length, FolderPath, created_at FROM djmdContent
+                 WHERE ID = ? AND rb_local_deleted = 0",
+                params![content_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((file_size, length, folder_path, created_at)) = row {
+            candidates.push(DuplicateCandidate {
+                content_id,
+                analysis_match,
+                file_size,
+                length,
+                folder_path,
+                created_at,
+            });
+        }
+    }
+
+    let audio_entry = pack_data
+        .get("audio_files")
+        .and_then(|v| v.as_array())
+        .and_then(|files| {
+            files.iter().find(|af| {
+                af.get("content_id").and_then(|v| v.as_str()) == Some(pack_cid)
+            })
+        })
+        .and_then(|af| af.get("relative_path").and_then(|v| v.as_str()))
+        .map(|rel| format!("files/{}", rel.replace('\\', "/")));
+
+    let mut matches: Vec<(DuplicateMatchKind, &DuplicateCandidate)> = Vec::new();
+    for cand in &candidates {
+        let size_equal = pack_size.is_some() && cand.file_size == pack_size;
+        let audio_identical = size_equal
+            && match &audio_entry {
+                Some(entry_name) => match (
+                    archive.by_name(entry_name),
+                    fs::File::open(&cand.folder_path),
+                ) {
+                    (Ok(entry), Ok(file)) => streams_equal(entry, io::BufReader::new(file))
+                        .unwrap_or(false),
+                    _ => false,
+                },
+                None => false,
+            };
+        if audio_identical {
+            matches.push((DuplicateMatchKind::AudioIdentical, cand));
+        } else if cand.analysis_match && pack_length.is_some() && cand.length == pack_length {
+            matches.push((DuplicateMatchKind::SameAnalysis, cand));
+        }
+    }
+
+    let rank = |kind: DuplicateMatchKind| match kind {
+        DuplicateMatchKind::AudioIdentical => 0,
+        _ => 1,
+    };
+    matches.sort_by(|(ka, a), (kb, b)| {
+        rank(*ka)
+            .cmp(&rank(*kb))
+            .then(b.analysis_match.cmp(&a.analysis_match))
+            .then(a.created_at.cmp(&b.created_at))
+    });
+    Ok(matches.first().map(|(kind, cand)| FoundDuplicate {
+        existing_content_id: cand.content_id.clone(),
+        kind: *kind,
+        candidate_count: matches.len(),
+    }))
+}
+
 fn detect_duplicate_contents(
     conn: &Connection,
+    archive: &mut ZipArchive<fs::File>,
+    pack_data: &serde_json::Value,
     tables: &serde_json::Map<String, serde_json::Value>,
     progress: &dyn Fn(&str),
     confirm: &dyn Fn(&DuplicateInfo) -> bool,
@@ -174,37 +436,36 @@ fn detect_duplicate_contents(
     let mut update_content_ids: HashSet<String> = HashSet::new();
     let mut existing_content_map: HashMap<String, String> = HashMap::new();
 
-    if let Some(content_files) = tables.get("contentFile").and_then(|v| v.as_array()) {
-        for cf in content_files {
-            let hash = cf.get("Hash").and_then(|h| h.as_str());
-            let pack_content_id = cf.get("ContentID").and_then(|c| c.as_str());
-            if let (Some(hash), Some(pack_cid)) = (hash, pack_content_id) {
-                if hash.is_empty() {
-                    continue;
-                }
-                let existing: Option<String> = conn
-                    .query_row(
-                        "SELECT ContentID FROM contentFile WHERE Hash = ? AND rb_local_deleted = 0 LIMIT 1",
-                        params![hash],
-                        |row| row.get(0),
-                    )
-                    .ok();
-                if let Some(existing_cid) = existing {
-                    progress(&format!(
-                        "重複トラック検出: ContentID {} (Hash: {}) → 既存 ContentID {}",
-                        pack_cid, hash, existing_cid
-                    ));
+    let pack_cids: Vec<String> = tables
+        .get("djmdContent")
+        .and_then(|v| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r.get("ID").and_then(|v| v.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
 
-                    let info = build_duplicate_info(conn, tables, pack_cid, &existing_cid);
-                    if confirm(&info) {
-                        update_content_ids.insert(pack_cid.to_string());
-                    } else {
-                        skipped_content_ids.insert(pack_cid.to_string());
-                    }
-                    existing_content_map.insert(pack_cid.to_string(), existing_cid);
-                }
+    for pack_cid in &pack_cids {
+        let Some(found) = find_duplicate(conn, archive, pack_data, tables, pack_cid)? else {
+            continue;
+        };
+        progress(&format!(
+            "重複トラック検出: ContentID {} → 既存 ContentID {} ({})",
+            pack_cid,
+            found.existing_content_id,
+            match found.kind {
+                DuplicateMatchKind::AudioIdentical => "音声ファイル一致",
+                _ => "解析データ一致",
             }
+        ));
+        let info = build_duplicate_info(conn, tables, pack_cid, &found);
+        if confirm(&info) {
+            update_content_ids.insert(pack_cid.clone());
+        } else {
+            skipped_content_ids.insert(pack_cid.clone());
         }
+        existing_content_map.insert(pack_cid.clone(), found.existing_content_id);
     }
 
     Ok((skipped_content_ids, update_content_ids, existing_content_map))
@@ -272,6 +533,7 @@ const RELATED_TABLES: &[&str] = &[
 fn build_master_id_map(
     conn: &Connection,
     tables: &serde_json::Map<String, serde_json::Value>,
+    allocator: &mut IdAllocator,
     id_map: &mut IdMap,
 ) -> Result<()> {
     for &table in MASTER_TABLES {
@@ -280,7 +542,6 @@ fn build_master_id_map(
             None => continue,
         };
         let name_col = master_table_name_column(table);
-        let mut max_id = get_max_numeric_id(conn, table)?;
         let mut table_map = HashMap::new();
 
         for row in rows {
@@ -319,8 +580,7 @@ fn build_master_id_map(
                 }
             }
 
-            max_id += 1;
-            table_map.insert(old_id, max_id.to_string());
+            table_map.insert(old_id, allocator.allocate(conn, table)?);
         }
 
         id_map.insert(table.to_string(), table_map);
@@ -329,56 +589,149 @@ fn build_master_id_map(
     Ok(())
 }
 
+/// 新規追加トラックに指定された ContentID が挿入可能か検証する。
+/// 数値であること、指定同士で重複しないこと、DB 上の既存行 (論理削除済み含む) と衝突しないことを確認する。
+pub fn validate_new_content_ids(
+    conn: &Connection,
+    new_content_ids: &HashMap<String, String>,
+) -> Result<()> {
+    let mut seen: HashMap<&str, &str> = HashMap::new();
+    for (pack_cid, new_cid) in new_content_ids {
+        if new_cid.is_empty() || !new_cid.bytes().all(|b| b.is_ascii_digit()) {
+            anyhow::bail!(
+                "ContentID '{}' は数値ではありません (パック内 ContentID {})",
+                new_cid,
+                pack_cid
+            );
+        }
+        if new_cid.parse::<u64>().map_or(true, |v| v >= CONTENT_ID_LIMIT) {
+            anyhow::bail!(
+                "ContentID {} は rekordbox の採番範囲 (2^28 = {} 未満) の外です (パック内 ContentID {})",
+                new_cid,
+                CONTENT_ID_LIMIT,
+                pack_cid
+            );
+        }
+        if let Some(other) = seen.insert(new_cid.as_str(), pack_cid.as_str()) {
+            anyhow::bail!(
+                "ContentID {} が複数のトラックに指定されています (パック内 ContentID {} と {})",
+                new_cid,
+                other,
+                pack_cid
+            );
+        }
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT rb_local_deleted FROM djmdContent WHERE ID = ?",
+                params![new_cid],
+                |row| row.get(0),
+            )
+            .ok();
+        match exists {
+            Some(0) => anyhow::bail!(
+                "ContentID {} は既存トラックで使用中です (パック内 ContentID {})",
+                new_cid,
+                pack_cid
+            ),
+            Some(_) => anyhow::bail!(
+                "ContentID {} は削除済みトラックの行が残っているため使用できません (パック内 ContentID {})",
+                new_cid,
+                pack_cid
+            ),
+            None => {}
+        }
+    }
+    Ok(())
+}
+
 fn build_content_id_map(
     conn: &Connection,
     tables: &serde_json::Map<String, serde_json::Value>,
     existing_content_map: &HashMap<String, String>,
+    new_content_ids: &HashMap<String, String>,
+    allocator: &mut IdAllocator,
     id_map: &mut IdMap,
 ) -> Result<()> {
+    validate_new_content_ids(conn, new_content_ids)?;
+
     let content_table = "djmdContent";
+    // 自動採番が指定 ID と衝突しないよう、先に予約する
+    for new_cid in new_content_ids.values() {
+        allocator.reserve(content_table, new_cid);
+    }
+
+    let empty = Vec::new();
     let rows = tables
         .get(content_table)
         .and_then(|v| v.as_array())
-        .unwrap_or(&Vec::new())
-        .clone();
-    let mut max_id = get_max_numeric_id(conn, content_table)?;
+        .unwrap_or(&empty);
     let mut table_map = HashMap::new();
 
-    for row in &rows {
+    for row in rows {
         let old_id = match row.get("ID").and_then(|v| v.as_str()) {
             Some(id) => id.to_string(),
             None => continue,
         };
 
-        if let Some(existing_cid) = existing_content_map.get(&old_id) {
-            table_map.insert(old_id, existing_cid.clone());
+        let new_id = if let Some(existing_cid) = existing_content_map.get(&old_id) {
+            existing_cid.clone()
+        } else if let Some(new_cid) = new_content_ids.get(&old_id) {
+            new_cid.clone()
         } else {
-            max_id += 1;
-            table_map.insert(old_id, max_id.to_string());
-        }
+            allocator.allocate(conn, content_table)?
+        };
+        table_map.insert(old_id, new_id);
     }
 
     id_map.insert(content_table.to_string(), table_map);
     Ok(())
 }
 
+/// rekordbox と同じ方式 (28bit 乱数) で、未使用の ContentID を `count` 個生成する。
+/// `exclude` に含まれる ID (プレビューで他のトラックに割り当て済みの ID など) は避ける。
+pub fn generate_content_ids(
+    conn: &Connection,
+    count: usize,
+    exclude: &HashSet<String>,
+) -> Result<Vec<String>> {
+    let mut allocator = IdAllocator::new();
+    for id in exclude {
+        allocator.reserve("djmdContent", id);
+    }
+    (0..count)
+        .map(|_| allocator.allocate(conn, "djmdContent"))
+        .collect()
+}
+
 fn build_related_id_maps(
     conn: &Connection,
     tables: &serde_json::Map<String, serde_json::Value>,
     pack_data: &serde_json::Value,
+    allocator: &mut IdAllocator,
     id_map: &mut IdMap,
+    progress: &dyn Fn(&str),
 ) -> Result<()> {
     // Playlist ID map
     {
-        let mut max_id = get_max_numeric_id(conn, "djmdPlaylist")?;
         let mut table_map = HashMap::new();
         if let Some(playlist) = pack_data.get("playlist")
-            && let Some(old_id) = playlist.get("ID").and_then(|v| v.as_str()) {
-                max_id += 1;
-                table_map.insert(old_id.to_string(), max_id.to_string());
-            }
+            && let Some(old_id) = playlist.get("ID").and_then(|v| v.as_str())
+        {
+            table_map.insert(old_id.to_string(), allocator.allocate(conn, "djmdPlaylist")?);
+        }
         id_map.insert("djmdPlaylist".to_string(), table_map);
     }
+
+    // contentFile の ID は djmdContent.UUID から作るので、パック内 ContentID → UUID を引けるようにする
+    let content_uuids: HashMap<&str, &str> = tables
+        .get("djmdContent")
+        .and_then(|v| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| Some((r.get("ID")?.as_str()?, r.get("UUID")?.as_str()?)))
+                .collect()
+        })
+        .unwrap_or_default();
 
     // Related tables + djmdSongPlaylist
     let all_id_tables: Vec<&str> = RELATED_TABLES
@@ -391,7 +744,6 @@ fn build_related_id_maps(
             Some(r) => r,
             None => continue,
         };
-        let mut max_id = get_max_numeric_id(conn, table)?;
         let mut table_map = HashMap::new();
 
         for row in rows {
@@ -399,14 +751,52 @@ fn build_related_id_maps(
                 Some(id) => id.to_string(),
                 None => continue,
             };
-            max_id += 1;
-            table_map.insert(old_id, max_id.to_string());
+            let new_id = if table == "contentFile" {
+                allocate_content_file_id(conn, row, &content_uuids, allocator, progress)?
+            } else {
+                allocator.allocate(conn, table)?
+            };
+            table_map.insert(old_id, new_id);
         }
 
         id_map.insert(table.to_string(), table_map);
     }
 
     Ok(())
+}
+
+fn allocate_content_file_id(
+    conn: &Connection,
+    row: &serde_json::Value,
+    content_uuids: &HashMap<&str, &str>,
+    allocator: &mut IdAllocator,
+    progress: &dyn Fn(&str),
+) -> Result<String> {
+    let path = row.get("Path").and_then(|v| v.as_str()).unwrap_or("");
+    let content_uuid = row
+        .get("ContentID")
+        .and_then(|v| v.as_str())
+        .and_then(|cid| content_uuids.get(cid).copied());
+
+    if let Some(content_uuid) = content_uuid
+        && let Some(id) = allocator.allocate_content_file(conn, content_uuid, path)?
+    {
+        return Ok(id);
+    }
+
+    // UUID が無い、または同じ ID が既にある (同じパックを新規として二重に取り込んだ場合など)。
+    // 形式だけ合わせて、先頭の UUID を新しく作る。
+    progress(&format!(
+        "警告: contentFile の ID を rekordbox 形式で作れないため、新しい UUID で代用します: {}",
+        path
+    ));
+    loop {
+        let candidate = content_file_id(&uuid::Uuid::new_v4().to_string(), path);
+        if !id_exists(conn, "contentFile", &candidate)? {
+            allocator.reserve("contentFile", &candidate);
+            return Ok(candidate);
+        }
+    }
 }
 
 fn extract_audio_files(
@@ -604,6 +994,7 @@ fn insert_master_tables(
     conn: &Connection,
     tables: &serde_json::Map<String, serde_json::Value>,
     id_map: &IdMap,
+    usn: &mut UsnCounter,
     inserted_count: &mut u32,
     skipped_count: &mut u32,
 ) -> Result<()> {
@@ -617,11 +1008,12 @@ fn insert_master_tables(
                 Some(id) => id,
                 None => continue,
             };
-            let mapped_row = apply_mapping(row, table, id_map);
+            let mut mapped_row = apply_mapping(row, table, id_map);
             let new_id = mapped_row
                 .get("ID")
                 .and_then(|v| v.as_str())
-                .unwrap_or("");
+                .unwrap_or("")
+                .to_string();
             let old_id_str = old_id.to_string();
             if let Some(table_map) = id_map.get(table)
                 && let Some(mapped_id) = table_map.get(&old_id_str) {
@@ -637,6 +1029,7 @@ fn insert_master_tables(
                         continue;
                     }
                 }
+            usn.assign(table, &mut mapped_row);
             insert_row(tx, table, &mapped_row)
                 .with_context(|| format!("{} への挿入に失敗 (ID: {})", table, new_id))?;
             *inserted_count += 1;
@@ -654,6 +1047,7 @@ fn insert_content_rows(
     dest_dir: &str,
     target_dbid: &Option<String>,
     target_device_id: &Option<String>,
+    usn: &mut UsnCounter,
     inserted_count: &mut u32,
     skipped_count: &mut u32,
 ) -> Result<()> {
@@ -714,6 +1108,7 @@ fn insert_content_rows(
                 }
             }
 
+            usn.assign(content_table, &mut mapped_row);
             insert_row(tx, content_table, &mapped_row)
                 .with_context(|| {
                     format!("djmdContent への挿入に失敗 (old ID: {})", old_id)
@@ -732,6 +1127,7 @@ fn insert_related_tables(
     update_content_ids: &HashSet<String>,
     data_actual_paths: &HashMap<String, String>,
     share_dir: &std::path::Path,
+    usn: &mut UsnCounter,
     inserted_count: &mut u32,
     skipped_count: &mut u32,
 ) -> Result<()> {
@@ -780,6 +1176,7 @@ fn insert_related_tables(
             }
 
             remap_json_blob(&mut mapped_row, table, id_map);
+            usn.assign(table, &mut mapped_row);
 
             let new_id = mapped_row
                 .get("ID")
@@ -798,6 +1195,7 @@ fn insert_playlist_and_songs(
     tables: &serde_json::Map<String, serde_json::Value>,
     pack_data: &serde_json::Value,
     id_map: &IdMap,
+    usn: &mut UsnCounter,
     inserted_count: &mut u32,
 ) -> Result<()> {
     if let Some(playlist) = pack_data.get("playlist") {
@@ -809,6 +1207,7 @@ fn insert_playlist_and_songs(
                 serde_json::Value::String("root".to_string()),
             );
         }
+        usn.assign("djmdPlaylist", &mut mapped);
         insert_row(tx, "djmdPlaylist", &mapped).context("djmdPlaylist への挿入に失敗")?;
         *inserted_count += 1;
     }
@@ -817,13 +1216,17 @@ fn insert_playlist_and_songs(
         .get("djmdSongPlaylist")
         .and_then(|v| v.as_array())
     {
-        for row in rows {
-            let mapped_row = apply_mapping(row, "djmdSongPlaylist", id_map);
+        let mut mapped_rows: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|row| apply_mapping(row, "djmdSongPlaylist", id_map))
+            .collect();
+        usn.assign_batch("djmdSongPlaylist", &mut mapped_rows);
+        for mapped_row in &mapped_rows {
             let new_id = mapped_row
                 .get("ID")
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
-            insert_row(tx, "djmdSongPlaylist", &mapped_row).with_context(|| {
+            insert_row(tx, "djmdSongPlaylist", mapped_row).with_context(|| {
                 format!("djmdSongPlaylist への挿入に失敗 (ID: {})", new_id)
             })?;
             *inserted_count += 1;
@@ -853,12 +1256,20 @@ pub fn unpack_playlist(
         .context("tables が見つかりません")?;
 
     let (skipped_content_ids, update_content_ids, existing_content_map) =
-        detect_duplicate_contents(conn, tables, progress, confirm)?;
+        detect_duplicate_contents(conn, &mut archive, &pack_data, tables, progress, confirm)?;
 
     let mut id_map: IdMap = HashMap::new();
-    build_master_id_map(conn, tables, &mut id_map)?;
-    build_content_id_map(conn, tables, &existing_content_map, &mut id_map)?;
-    build_related_id_maps(conn, tables, &pack_data, &mut id_map)?;
+    let mut allocator = IdAllocator::new();
+    build_master_id_map(conn, tables, &mut allocator, &mut id_map)?;
+    build_content_id_map(
+        conn,
+        tables,
+        &existing_content_map,
+        &HashMap::new(),
+        &mut allocator,
+        &mut id_map,
+    )?;
+    build_related_id_maps(conn, tables, &pack_data, &mut allocator, &mut id_map, progress)?;
 
     let share_dir = get_share_dir();
 
@@ -876,6 +1287,7 @@ pub fn unpack_playlist(
     progress("DBへの挿入を開始...");
 
     let tx = conn.unchecked_transaction()?;
+    let mut usn = UsnCounter::load(&tx)?;
 
     // 更新対象の既存関連データを削除
     for pack_cid in &update_content_ids {
@@ -888,7 +1300,15 @@ pub fn unpack_playlist(
     let mut inserted_count = 0u32;
     let mut skipped_count = 0u32;
 
-    insert_master_tables(&tx, conn, tables, &id_map, &mut inserted_count, &mut skipped_count)?;
+    insert_master_tables(
+        &tx,
+        conn,
+        tables,
+        &id_map,
+        &mut usn,
+        &mut inserted_count,
+        &mut skipped_count,
+    )?;
 
     let content_skip_ids: HashSet<String> = skipped_content_ids
         .union(&update_content_ids)
@@ -903,6 +1323,7 @@ pub fn unpack_playlist(
         dest_dir,
         &target_dbid,
         &target_device_id,
+        &mut usn,
         &mut inserted_count,
         &mut skipped_count,
     )?;
@@ -915,12 +1336,14 @@ pub fn unpack_playlist(
         &update_content_ids,
         &data_actual_paths,
         &share_dir,
+        &mut usn,
         &mut inserted_count,
         &mut skipped_count,
     )?;
 
-    insert_playlist_and_songs(&tx, tables, &pack_data, &id_map, &mut inserted_count)?;
+    insert_playlist_and_songs(&tx, tables, &pack_data, &id_map, &mut usn, &mut inserted_count)?;
 
+    usn.save(&tx)?;
     tx.commit()?;
 
     progress("アンパック完了!");
@@ -1001,6 +1424,8 @@ pub fn load_unpack_preview(
         .collect();
 
     let mut tracks = Vec::new();
+    // 新規トラックには実行時に使われる ContentID を事前に割り当てて表示する
+    let mut allocator = IdAllocator::new();
 
     for content in &contents {
         let pack_cid = content
@@ -1044,43 +1469,23 @@ pub fn load_unpack_preview(
             .filter(|c| c.get("Kind").and_then(|v| v.as_i64()) != Some(0))
             .count();
 
-        // Check for duplicate via contentFile Hash
-        let mut duplicate = None;
-        if let Some(content_files) = tables.get("contentFile").and_then(|v| v.as_array()) {
-            for cf in content_files {
-                let cf_cid = cf.get("ContentID").and_then(|v| v.as_str());
-                let hash = cf.get("Hash").and_then(|v| v.as_str());
-                if let (Some(cf_cid), Some(hash)) = (cf_cid, hash) {
-                    if cf_cid == pack_cid && !hash.is_empty() {
-                        let existing: Option<String> = conn
-                            .query_row(
-                                "SELECT ContentID FROM contentFile WHERE Hash = ? AND rb_local_deleted = 0 LIMIT 1",
-                                params![hash],
-                                |row| row.get(0),
-                            )
-                            .ok();
-                        if let Some(existing_cid) = existing {
-                            let info =
-                                build_duplicate_info(conn, tables, &pack_cid, &existing_cid);
-                            duplicate = Some(DuplicateMatch {
-                                existing_content_id: existing_cid,
-                                info,
-                            });
-                        }
-                    }
+        let duplicate = find_duplicate(conn, &mut archive, &pack_data, tables, &pack_cid)?
+            .map(|found| {
+                let info = build_duplicate_info(conn, tables, &pack_cid, &found);
+                DuplicateMatch {
+                    existing_content_id: found.existing_content_id,
+                    info,
                 }
-            }
-        }
+            });
 
-        let decision = if duplicate.is_some() {
-            DuplicateDecision::Skip
-        } else {
-            DuplicateDecision::New
+        let (decision, content_id_input) = match duplicate {
+            Some(ref dup) => (DuplicateDecision::Skip, dup.existing_content_id.clone()),
+            None => (DuplicateDecision::New, allocator.allocate(conn, "djmdContent")?),
         };
 
         tracks.push(UnpackTrackPreview {
-            pack_content_id: pack_cid.clone(),
-            content_id_input: pack_cid,
+            pack_content_id: pack_cid,
+            content_id_input,
             title,
             artist,
             album,
@@ -1102,38 +1507,19 @@ pub fn check_content_id_duplicate(
     conn: &Connection,
     content_id: &str,
 ) -> Result<Option<DuplicateInfo>> {
-    let exists: Option<String> = conn
-        .query_row(
-            "SELECT Title FROM djmdContent WHERE ID = ? AND rb_local_deleted = 0",
-            params![content_id],
-            |row| row.get(0),
-        )
-        .ok();
-
-    let Some(existing_title) = exists else {
+    let Some(existing) = query_existing_track(conn, content_id) else {
         return Ok(None);
     };
 
-    let existing_memory_cue_count: usize = conn
-        .query_row(
-            "SELECT COUNT(*) FROM djmdCue WHERE ContentID = ? AND Kind = 0 AND rb_local_deleted = 0",
-            params![content_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(0) as usize;
-
-    let existing_hot_cue_count: usize = conn
-        .query_row(
-            "SELECT COUNT(*) FROM djmdCue WHERE ContentID = ? AND Kind != 0 AND rb_local_deleted = 0",
-            params![content_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(0) as usize;
-
     Ok(Some(DuplicateInfo {
-        existing_title,
-        existing_memory_cue_count,
-        existing_hot_cue_count,
+        match_kind: DuplicateMatchKind::ContentId,
+        candidate_count: 1,
+        existing_title: existing.title,
+        existing_artist: existing.artist,
+        existing_album: existing.album,
+        existing_path: existing.path,
+        existing_memory_cue_count: existing.memory_cue_count,
+        existing_hot_cue_count: existing.hot_cue_count,
         new_title: String::new(),
         new_memory_cue_count: 0,
         new_hot_cue_count: 0,
@@ -1176,9 +1562,17 @@ pub fn unpack_playlist_with_decisions(
     let existing_content_map = &decisions.existing_content_map;
 
     let mut id_map: IdMap = HashMap::new();
-    build_master_id_map(conn, tables, &mut id_map)?;
-    build_content_id_map(conn, tables, existing_content_map, &mut id_map)?;
-    build_related_id_maps(conn, tables, &pack_data, &mut id_map)?;
+    let mut allocator = IdAllocator::new();
+    build_master_id_map(conn, tables, &mut allocator, &mut id_map)?;
+    build_content_id_map(
+        conn,
+        tables,
+        existing_content_map,
+        &decisions.new_content_ids,
+        &mut allocator,
+        &mut id_map,
+    )?;
+    build_related_id_maps(conn, tables, &pack_data, &mut allocator, &mut id_map, progress)?;
 
     let share_dir = get_share_dir();
 
@@ -1196,6 +1590,7 @@ pub fn unpack_playlist_with_decisions(
     progress("DBへの挿入を開始...");
 
     let tx = conn.unchecked_transaction()?;
+    let mut usn = UsnCounter::load(&tx)?;
 
     for pack_cid in update_content_ids {
         if let Some(existing_cid) = existing_content_map.get(pack_cid) {
@@ -1207,7 +1602,15 @@ pub fn unpack_playlist_with_decisions(
     let mut inserted_count = 0u32;
     let mut skipped_count = 0u32;
 
-    insert_master_tables(&tx, conn, tables, &id_map, &mut inserted_count, &mut skipped_count)?;
+    insert_master_tables(
+        &tx,
+        conn,
+        tables,
+        &id_map,
+        &mut usn,
+        &mut inserted_count,
+        &mut skipped_count,
+    )?;
 
     let content_skip_ids: HashSet<String> = skipped_content_ids
         .union(update_content_ids)
@@ -1222,6 +1625,7 @@ pub fn unpack_playlist_with_decisions(
         dest_dir,
         &target_dbid,
         &target_device_id,
+        &mut usn,
         &mut inserted_count,
         &mut skipped_count,
     )?;
@@ -1234,12 +1638,14 @@ pub fn unpack_playlist_with_decisions(
         update_content_ids,
         &data_actual_paths,
         &share_dir,
+        &mut usn,
         &mut inserted_count,
         &mut skipped_count,
     )?;
 
-    insert_playlist_and_songs(&tx, tables, &pack_data, &id_map, &mut inserted_count)?;
+    insert_playlist_and_songs(&tx, tables, &pack_data, &id_map, &mut usn, &mut inserted_count)?;
 
+    usn.save(&tx)?;
     tx.commit()?;
 
     progress("アンパック完了!");

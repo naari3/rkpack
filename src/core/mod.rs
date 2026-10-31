@@ -10,7 +10,7 @@ pub use query::{
     PlaylistInfo, TrackInfo, get_playlist_tracks, get_playlists, list_playlists, list_tables,
 };
 pub use unpack::{
-    DuplicateDecision, DuplicateInfo, DuplicateMatch, UnpackDecisions, UnpackPreviewData,
+    DuplicateDecision, DuplicateInfo, DuplicateMatch, DuplicateMatchKind, UnpackDecisions, UnpackPreviewData,
     check_content_id_duplicate, load_unpack_preview, unpack_playlist,
-    unpack_playlist_with_decisions,
+    generate_content_ids, unpack_playlist_with_decisions, validate_new_content_ids,
 };
