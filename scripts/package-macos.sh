@@ -2,7 +2,7 @@
 # macOS 用に universal (arm64 + x86_64) の rkpack.app を作って dist/ に zip で固める。
 # 使い方: scripts/package-macos.sh
 # 前提: rustup target add aarch64-apple-darwin x86_64-apple-darwin, cargo install cargo-bundle
-# 出力: dist/rkpack-v<version>-universal-apple-darwin.zip (中身は rkpack.app)
+# 出力: dist/rkpack-v<version>-universal-apple-darwin.zip (中身は rkpack.app と packaging/macos/*.txt)
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -32,5 +32,12 @@ codesign --verify --deep --strict "$app"
 mkdir -p dist
 zip="dist/rkpack-v$version-universal-apple-darwin.zip"
 rm -f "$zip"
-ditto -c -k --sequesterRsrc --keepParent "$app" "$zip"
+
+# zip の直下に rkpack.app と初回起動の手順書を並べる
+staging="target/macos-package"
+rm -rf "$staging"
+mkdir -p "$staging"
+ditto "$app" "$staging/rkpack.app"
+cp packaging/macos/*.txt "$staging/"
+ditto -c -k --sequesterRsrc "$staging" "$zip"
 echo "created: $zip"

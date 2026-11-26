@@ -26,14 +26,14 @@ cargo install cargo-bundle
 scripts/package-macos.sh
 ```
 
-`dist/rkpack-v<version>-universal-apple-darwin.zip` (中身は universal バイナリの `rkpack.app`) が生成される。
+`dist/rkpack-v<version>-universal-apple-darwin.zip` が生成される。中身は universal バイナリの `rkpack.app` と、初回起動の手順書 `packaging/macos/はじめにお読みください.txt`。
 Developer ID 署名と公証はしておらず、ad-hoc 署名のみ。
 
 ## macOS での初回起動
 
 ダウンロードした `rkpack.app` は Gatekeeper に止められる。次のどちらかで許可する。
 
-- 一度開こうとしてから「システム設定 > プライバシーとセキュリティ」の「このまま開く」を押す
+- 一度開こうとしてから「システム設定 > プライバシーとセキュリティ」の「このまま開く」を押す (2026-11-26 に確認済み)
 - ターミナルで quarantine 属性を外す
 
 ```
