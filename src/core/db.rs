@@ -86,6 +86,23 @@ pub(crate) fn to_nfc(s: &str) -> String {
     s.nfc().collect()
 }
 
+/// djmdContent.rb_file_id に入る、ファイルシステム上のファイル固有 ID を返す。
+/// macOS では inode 番号、Windows では NTFS のファイル参照番号 (64bit の file index)。
+/// ファイルごと・ボリュームごとに変わる値なので、別マシンの DB から持ち込んだ値は使えない。
+#[cfg(unix)]
+pub(crate) fn file_id_on_disk(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path).ok().map(|m| m.ino())
+}
+
+#[cfg(windows)]
+pub(crate) fn file_id_on_disk(path: &std::path::Path) -> Option<u64> {
+    let handle = winapi_util::Handle::from_path(path).ok()?;
+    winapi_util::file::information(&handle)
+        .ok()
+        .map(|info| info.file_index())
+}
+
 pub(crate) fn get_actual_path_on_disk(expected: &std::path::Path) -> PathBuf {
     let Some(parent) = expected.parent() else {
         return expected.to_path_buf();

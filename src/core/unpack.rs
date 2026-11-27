@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use zip::ZipArchive;
 
-use super::db::get_actual_path_on_disk;
+use super::db::{file_id_on_disk, get_actual_path_on_disk};
 use super::id_mapping::{
     CONTENT_ID_LIMIT, IdAllocator, IdMap, UsnCounter, apply_mapping, content_file_id,
     find_existing_master_id, id_exists, insert_row, master_table_name_column, remap_json_blob,
@@ -1090,6 +1090,13 @@ fn insert_content_rows(
                         "rb_LocalFolderPath".to_string(),
                         serde_json::Value::String(actual_path.clone()),
                     );
+                    // rb_file_id は配置先ファイルの実体と一致している必要がある
+                    if let Some(file_id) = file_id_on_disk(std::path::Path::new(actual_path)) {
+                        obj.insert(
+                            "rb_file_id".to_string(),
+                            serde_json::Value::String(file_id.to_string()),
+                        );
+                    }
                 } else {
                     let dest_normalized = dest_dir.replace('\\', "/");
                     let dest_with_slash = if dest_normalized.ends_with('/') {

@@ -187,5 +187,16 @@ AUDIO_FILE_COUNT=$(find "$DEST_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')
 [ "$AUDIO_FILE_COUNT" -ge 1 ] || fail "音声ファイルが配置されていない"
 pass "音声ファイル配置済み ($AUDIO_FILE_COUNT 件)"
 
+# 4-13. rb_file_id が配置先ファイルの inode と一致 (stat の書式が違うので macOS のみ)
+if [ "$(uname)" = "Darwin" ]; then
+    BAD_FILE_ID=0
+    while IFS=$'\t' read -r FILE_ID FILE_PATH; do
+        [ "$FILE_ID" = "$(stat -f '%i' "$FILE_PATH")" ] || BAD_FILE_ID=$((BAD_FILE_ID + 1))
+    done < <(echo "SELECT rb_file_id, FolderPath FROM djmdContent WHERE rb_local_deleted = 0;" \
+        | sqlite3 -separator $'\t' "$DEST_DB")
+    [ "$BAD_FILE_ID" -eq 0 ] || fail "rb_file_id と inode の不一致: $BAD_FILE_ID 件"
+    pass "rb_file_id = 配置先ファイルの inode"
+fi
+
 echo ""
 echo "=== 全テスト合格 ==="
