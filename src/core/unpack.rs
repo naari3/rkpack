@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use zip::ZipArchive;
 
-use super::db::{file_id_on_disk, get_actual_path_on_disk};
+use super::db::{file_id_on_disk, get_actual_path_on_disk, path_for_db};
 use super::id_mapping::{
     CONTENT_ID_LIMIT, IdAllocator, IdMap, UsnCounter, apply_mapping, content_file_id,
     find_existing_master_id, id_exists, insert_row, master_table_name_column, remap_json_blob,
@@ -866,7 +866,7 @@ fn extract_audio_files(
                 Ok(_) => {
                     file_copy_success += 1;
                     let actual = get_actual_path_on_disk(&target);
-                    let actual_str = actual.to_string_lossy().replace('\\', "/");
+                    let actual_str = path_for_db(&actual.to_string_lossy().replace('\\', "/"));
                     audio_actual_paths.insert(content_id.to_string(), actual_str);
                 }
                 Err(e) => {
@@ -925,7 +925,7 @@ fn extract_data_files(
                 Ok(_) => {
                     data_file_success += 1;
                     let actual = get_actual_path_on_disk(&target);
-                    let actual_str = actual.to_string_lossy().to_string();
+                    let actual_str = path_for_db(&actual.to_string_lossy());
                     data_actual_paths.insert(cf_id.to_string(), actual_str);
                 }
                 Err(e) => {
@@ -1098,7 +1098,7 @@ fn insert_content_rows(
                         );
                     }
                 } else {
-                    let dest_normalized = dest_dir.replace('\\', "/");
+                    let dest_normalized = path_for_db(&dest_dir.replace('\\', "/"));
                     let dest_with_slash = if dest_normalized.ends_with('/') {
                         dest_normalized.clone()
                     } else {

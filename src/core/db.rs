@@ -86,6 +86,18 @@ pub(crate) fn to_nfc(s: &str) -> String {
     s.nfc().collect()
 }
 
+/// ファイルパスを rekordbox の DB に書く形にする。
+/// macOS の rekordbox はパスを NFC で保存し、曲をパス文字列の完全一致で探す。
+/// ファイルダイアログや readdir が返す NFD のまま書くと、同じファイルが別の曲として登録される。
+/// macOS のファイルシステムは正規化形式を区別しないので、NFC にしてもファイルは開ける。
+pub(crate) fn path_for_db(path: &str) -> String {
+    if cfg!(target_os = "macos") {
+        to_nfc(path)
+    } else {
+        path.to_string()
+    }
+}
+
 /// djmdContent.rb_file_id に入る、ファイルシステム上のファイル固有 ID を返す。
 /// macOS では inode 番号、Windows では NTFS のファイル参照番号 (64bit の file index)。
 /// ファイルごと・ボリュームごとに変わる値なので、別マシンの DB から持ち込んだ値は使えない。
